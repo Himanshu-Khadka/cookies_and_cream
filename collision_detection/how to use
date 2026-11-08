@@ -1,0 +1,13 @@
+use two seperate terminals
+
+*run actual arm
+python so101_follow_point.py --urdf /home/shao/Desktop/robot_test/SO-ARM100/Simulation/SO101/so101_new_calib.urdf --execute --relative --reach 0.08
+
+*send information to socket
+python -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for _ in range(90):
+    s.sendto(b'0 0 0.02', ('127.0.0.1', 5005))
+    time.sleep(1/30)
+"
