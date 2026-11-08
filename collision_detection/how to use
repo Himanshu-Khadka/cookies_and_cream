@@ -1,7 +1,12 @@
-use two seperate terminals
 
-*run actual arm
-python so101_follow_point.py --urdf /home/shao/Desktop/robot_test/SO-ARM100/Simulation/SO101/so101_new_calib.urdf --execute --relative --reach 0.08
+use two seperate terminals, both from the repo root
+(setup: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt)
+
+*run actual arm (Linux port is usually /dev/ttyACM0, Mac is /dev/tty.usbmodem...; find it with: lerobot-find-port)
+python reverse_kinematics/testing_folow_point.py --urdf hardware_test/SO-ARM100/Simulation/SO101/so101_new_calib.urdf --port /dev/ttyACM0 --execute --relative --reach 0.08
+
+*try without hardware first (gripper traces a small circle)
+python reverse_kinematics/testing_folow_point.py --urdf hardware_test/SO-ARM100/Simulation/SO101/so101_new_calib.urdf --demo
 
 *send information to socket
 python -c "

@@ -42,7 +42,7 @@ def rotate(arm, joint, degrees, held, speed):
                                   now - previous_tick, speed, 30)
         arm.send_action(targets)
         held, previous_tick = targets, now
-        if abs(held[joint] - target) < 0.01 and abs(measured[joint] - target) <= 0.5:
+        if abs(held[joint] - target) < 0.01 and abs(measured[joint] - target) <= 1.0:
             print(f"{joint}: {measured[joint]:.2f} degrees (target {target:.2f})")
             return held
         time.sleep(max(0, 1 / 30 - (time.monotonic() - now)))

@@ -94,6 +94,8 @@ def main():
     p.add_argument("--relative", action="store_true", help="points are offsets from the start position")
     p.add_argument("--demo", action="store_true", help="ignore UDP, trace a small circle")
     p.add_argument("--execute", action="store_true", help="move the real arm")
+    p.add_argument("--orientation-weight", type=float, default=0.01,
+                   help="how hard IK holds the starting gripper angle; 0 = position only (more reach)")
     args = p.parse_args()
 
     kin = RobotKinematics(args.urdf, "gripper_frame_link", ARM_JOINTS)
@@ -153,7 +155,7 @@ def main():
             q_cmd[:5] = np.clip(q_cmd[:5], q[:5] - MAX_LAG_DEG, q[:5] + MAX_LAG_DEG)
             q_cmd[5] = q[5]                  # gripper: leave where it is
 
-            q_new = kin.inverse_kinematics(q_cmd, T)   # start from last COMMAND
+            q_new = kin.inverse_kinematics(q_cmd, T, orientation_weight=args.orientation_weight)   # start from last COMMAND
             err = np.linalg.norm(kin.forward_kinematics(q_new)[:3, 3] - p_cmd)
 
             if err > MAX_POS_ERROR_M:
