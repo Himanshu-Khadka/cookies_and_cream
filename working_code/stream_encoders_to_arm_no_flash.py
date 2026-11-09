@@ -19,6 +19,11 @@ Controls:
     trigger_percent -> proportional gripper only when supported by firmware
     button     -> clutch (1 run, 0 freeze/hold)
 
+    --no-rail     Z (height) is not driven; the rail (AS5600) is not needed
+    --no-gripper  the gripper is not driven; the trigger is not needed
+    So joystick forward/back + roll + twist only:
+        python stream_encoders_to_arm_no_flash.py --no-rail --no-gripper
+
 All motion stops receiving new targets when button=0, input is invalid or stale.
 The program sends a one-time "hold current observed pose" command when an
 active clutch disengages, but THIS IS NOT AN EMERGENCY STOP: the servos can
@@ -91,21 +96,27 @@ def bounded_offset(current: float, movement: float, limit: float) -> float:
     return clip(proposed, -limit, limit)
 
 
-def valid_input(sample: Any, *, rail_uncertain: bool = False) -> str | None:
+def valid_input(sample: Any, *, rail_uncertain: bool = False,
+                need_rail: bool = True, need_trigger: bool = True) -> str | None:
     """Conservative fail-closed checks; return why the arm must hold."""
     if sample.button not in (0, 1):
         return "clutch button missing (controller firmware not sending it)"
     if sample.button == 0:
         return None  # disabled: sensor validity is irrelevant while parked
-    if rail_uncertain:
+    if need_rail and rail_uncertain:
         return "AS5600 rail has an uncertain turn count; stop and re-center it"
-    for name in ("arm_roll", "arm_twist", "arm_v", "joy_y", "trigger_percent"):
+    names = ["arm_roll", "arm_twist", "joy_y"]
+    if need_rail:
+        names.append("arm_v")
+    if need_trigger:
+        names.append("trigger_percent")
+    for name in names:
         value = getattr(sample, name, math.nan)
         if not isinstance(value, (float, int)) or not math.isfinite(value):
             if name == "trigger_percent":
                 return "trigger percentage unavailable (use --trigger-mode digital for existing firmware)"
             return f"{name} missing/invalid (no commands sent)"
-    if not 0 <= sample.trigger_percent <= 100:
+    if need_trigger and not 0 <= sample.trigger_percent <= 100:
         return "trigger_percent outside 0..100"
     if not -1.05 <= sample.joy_y <= 1.05:
         return "joystick outside expected -1..1 range"
@@ -169,9 +180,10 @@ class TargetState:
             "roll": LowPass(self.args.angle_smoothing, roll),
             "y": LowPass(self.args.axis_smoothing, 0.0),
             "z": LowPass(self.args.z_smoothing, 0.0),
-            "trigger": LowPass(self.args.trigger_smoothing, sample.trigger_percent),
+            "trigger": LowPass(self.args.trigger_smoothing,
+                               0.0 if self.args.no_gripper else sample.trigger_percent),
         }
-        self.trigger_pct = sample.trigger_percent
+        self.trigger_pct = 0.0 if self.args.no_gripper else sample.trigger_percent
         self.engaged = True
 
     def pause(self) -> None:
@@ -189,7 +201,8 @@ class TargetState:
             self.pan_start + mapped_pan - self.pan_anchor)
         self.roll_target = self.filters["roll"].update(
             self.roll_start + mapped_roll - self.roll_anchor)
-        self.trigger_pct = clip(self.filters["trigger"].update(sample.trigger_percent), 0, 100)
+        if not a.no_gripper:
+            self.trigger_pct = clip(self.filters["trigger"].update(sample.trigger_percent), 0, 100)
 
         raw_y = -sample.joy_y if a.invert_y else sample.joy_y
         # Stop promptly when the stick returns to center; otherwise a heavy
@@ -200,6 +213,12 @@ class TargetState:
             self.filters["y"].update(raw_y)
         self.y_speed = shaped_velocity(
             self.filters["y"].value, a.joy_deadzone, a.y_max_speed)
+
+        if a.no_rail:
+            # Height is not driven: Y moves alone, Z stays where it started.
+            self.z_speed = 0.0
+            self.y_cm = bounded_offset(self.y_cm, self.y_speed * dt, a.y_limit_cm)
+            return self.y_cm, self.z_cm
 
         # arm_v already has a saved center and an unwrapped gear turn count.
         # Median protects against isolated AS5600 spikes before the EMA.
@@ -324,6 +343,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--invert-z", action="store_true")
     p.add_argument("--trigger-mode", choices=("digital", "analog"), default="digital",
                    help="digital: existing firmware 0/1 open/close, no flashing; analog: percentage if firmware provides it")
+    p.add_argument("--no-rail", action="store_true",
+                   help="Do not drive Z (height) from the rail; the AS5600 is not needed")
+    p.add_argument("--no-gripper", action="store_true",
+                   help="Do not drive the gripper; the trigger is not needed")
     p.add_argument("--gripper-reverse", action="store_true",
                    help="Swap open and closed motor positions if needed")
     p.add_argument("--pitch", type=float, default=None,
@@ -386,7 +409,7 @@ def main() -> int:
     state = None
     try:
         encoders = EncoderStream(port=args.encoder_port, stlink=args.stlink)
-        if encoders.center is None or encoders.center.rail is None:
+        if not args.no_rail and (encoders.center is None or encoders.center.rail is None):
             raise RuntimeError(
                 "Saved center for BOTH MKS motors AND AS5600 is required. "
                 "Put all controls at neutral and run: python lib/read_encoders.py --center")
@@ -448,7 +471,9 @@ def main() -> int:
                                                  if sample.trigger in (0, 1)
                                                  else math.nan)
                     sample = SimpleNamespace(**values)
-                reason = valid_input(sample, rail_uncertain=encoders.rail_uncertain)
+                reason = valid_input(sample, rail_uncertain=encoders.rail_uncertain,
+                                     need_rail=not args.no_rail,
+                                     need_trigger=not args.no_gripper)
                 if reason:
                     pause("HOLD: " + reason)
                 elif sample.button == 0:
@@ -500,9 +525,10 @@ def main() -> int:
                             desired: dict[str, float] = {
                                 "shoulder_pan": state.pan_target,
                                 "wrist_roll": state.roll_target,
-                                "gripper": gripper_target(state.trigger_pct, bounds["gripper"],
-                                                          args.gripper_reverse),
                             }
+                            if not args.no_gripper:
+                                desired["gripper"] = gripper_target(
+                                    state.trigger_pct, bounds["gripper"], args.gripper_reverse)
                             if result is None:
                                 # Keep the last accepted tip target; do NOT accumulate
                                 # an unreachable Y/Z target and later jump toward it.
