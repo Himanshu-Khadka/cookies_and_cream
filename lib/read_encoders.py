@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Read the encoder angles from the Black Pill: print them, or import them.
+"""Read the arm's three encoders from the Black Pill: print them, or import them.
+
+One labeled stream:
+
+    arm_roll    wrist roll motor (MKS 1), degrees from the saved center
+    arm_twist   wrist twist motor (MKS 2), degrees from the saved center
+    arm_v       the linear rail (white AS5600 on the rail's small gear),
+                degrees of that gear from the saved center, counted across
+                full turns; or millimetres once --rail-mm-per-rev is set
 
 Runs on Windows, macOS and Linux with nothing to install: it only needs
 Python 3.8 or newer. (If pyserial happens to be installed it can be used
@@ -7,15 +15,19 @@ too, see --backend.)
 
 PRINT THE STREAM (run this file):
 
-    python read_encoders.py              stream (zero = the saved center)
-    python read_encoders.py --center     save the current pose as center, then stream
-    python read_encoders.py --flip 1     reverse motor 1's sign (saved), then stream
-    python read_encoders.py --flip 1,2   reverse both; --flip none = neither
-    python read_encoders.py --raw        stream the drivers' own angles, no center
-    python read_encoders.py --list       list the serial ports it can see
-    python read_encoders.py COM5         use this port (or /dev/ttyACM0, ...)
+    python read_encoders.py                    stream as CSV
+    python read_encoders.py --format labeled   arm_roll=... arm_twist=... arm_v=...
+    python read_encoders.py --format json      one JSON object per line
+    python read_encoders.py --center           save the current pose as center, then stream
+    python read_encoders.py --flip roll        reverse a sign (saved): roll, twist, v,
+                                               several with commas, or none
+    python read_encoders.py --rail-mm-per-rev 40   rail travel per gear turn (saved);
+                                               arm_v is then in millimetres (0 = degrees)
+    python read_encoders.py --raw              the drivers' own angles, no center
+    python read_encoders.py --list             list the serial ports it can see
+    python read_encoders.py COM5               use this port (or /dev/ttyACM0, ...)
 
-Output is CSV: time_ms, motor 1, motor 2, AS5600 (degrees). Ctrl-C stops it.
+CSV output is: time_ms,arm_roll,arm_twist,arm_v. Ctrl-C stops it.
 
 USE IT FROM YOUR OWN CODE (keep this file next to yours):
 
@@ -23,7 +35,7 @@ USE IT FROM YOUR OWN CODE (keep this file next to yours):
 
     with EncoderStream() as encoders:        # finds the board by itself
         for angles in encoders:              # one Angles per reading, forever
-            print(angles.motor1, angles.motor2, angles.as5600)
+            print(angles.arm_roll, angles.arm_twist, angles.arm_v)
 
     # or, inside a loop of your own that must not wait for the board:
     encoders = EncoderStream()
@@ -33,11 +45,19 @@ USE IT FROM YOUR OWN CODE (keep this file next to yours):
     ...
     encoders.close()
 
-Motor angles are degrees away from the saved center: 0 at center, positive
-one way, negative the other. nan (math.isnan) means that encoder did not
-answer. The center is kept in center.json next to this file. The drivers
-restart their angle count when they are powered off and on, so set the
-center again after a power cycle (--center, or EncoderStream.set_center()).
+A value is nan (math.isnan) when that encoder did not answer; for arm_v
+that includes the sensor seeing no magnet. The center is kept in
+center.json next to this file. The motor drivers restart their angle count
+when they are powered off and on, so set the center again after a power
+cycle (--center, or EncoderStream.set_center()).
+
+arm_v counts gear turns from where this program starts, so start it with
+the rail within half a gear turn of where it was centered (or center again).
+It can only keep count while the rail is read often enough: the gear must
+turn less than half a turn between two readings. In a "for angles in
+encoders" loop do no slow work between readings; if your loop is slow, use
+start() and latest(), which keep reading in the background. If the count
+may have slipped, a warning is printed once and rail_uncertain becomes True.
 
 Works with either firmware on the board: the encoder stream firmware (which
 sends lines by itself) or the motor test firmware (which is asked for a
@@ -63,7 +83,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-HEADER = "time_ms,motor1_deg,motor2_deg,as5600_deg"
+HEADER = "time_ms,arm_roll,arm_twist,arm_v"
 CENTER_FILE = Path(__file__).resolve().parent / "center.json"
 BAUD = 115200
 
@@ -77,6 +97,12 @@ DETECT_S = 1.5
 # Polling rate when the motor test firmware is on the board.
 POLL_PERIOD_S = 0.1
 POLL_TIMEOUT_S = 1.0
+
+# The rail's turn count can no longer be trusted when its gear seems to
+# move more than this between two readings (half a turn is the hard limit),
+# or when two rail readings are further apart than this.
+RAIL_SUSPECT_STEP_DEG = 120.0
+RAIL_SUSPECT_GAP_S = 0.25
 
 # Readings averaged when saving the center.
 CENTER_SAMPLES = 10
@@ -731,12 +757,24 @@ def candidate_ports() -> list[str]:
 
 @dataclass(frozen=True)
 class Center:
-    """The saved zero position and sign of each motor."""
+    """The saved zero position and sign of each encoder.
+
+    motor1 / motor2    driver angle of arm_roll / arm_twist at the center
+    flip1 / flip2      reverse the sign of arm_roll / arm_twist
+    rail               AS5600 angle (0-360) of the rail gear at the center,
+                       or None if the rail has not been centered
+    flip_rail          reverse the sign of arm_v
+    rail_mm_per_rev    rail travel for one turn of its gear, in millimetres;
+                       None = report arm_v in degrees of the gear
+    """
 
     motor1: float
     motor2: float
     flip1: bool
     flip2: bool
+    rail: float | None = None
+    flip_rail: bool = False
+    rail_mm_per_rev: float | None = None
 
 
 @dataclass(frozen=True)
@@ -769,6 +807,7 @@ def load_center() -> Center | None:
     motor2 = data.get("motor2")
     flip1 = data.get("flip1", False)
     flip2 = data.get("flip2", False)
+    flip_rail = data.get("flip_v", False)
 
     if (
         isinstance(motor1, bool)
@@ -777,8 +816,17 @@ def load_center() -> Center | None:
         or not isinstance(motor2, (int, float))
         or not isinstance(flip1, bool)
         or not isinstance(flip2, bool)
+        or not isinstance(flip_rail, bool)
     ):
         raise CenterError(f"{CENTER_FILE} has missing or wrong values")
+
+    rail = _optional_number(data.get("arm_v"), "arm_v")
+    rail_mm_per_rev = _optional_number(
+        data.get("arm_v_mm_per_rev"), "arm_v_mm_per_rev"
+    )
+
+    if rail_mm_per_rev is not None and rail_mm_per_rev <= 0:
+        raise CenterError(f"{CENTER_FILE}: arm_v_mm_per_rev must be above zero")
 
     try:
         zero1, zero2 = float(motor1), float(motor2)
@@ -791,17 +839,41 @@ def load_center() -> Center | None:
             "that file, or run with --center to replace it."
         )
 
-    return Center(zero1, zero2, flip1, flip2)
+    return Center(zero1, zero2, flip1, flip2, rail, flip_rail, rail_mm_per_rev)
+
+
+def _optional_number(value: object, name: str) -> float | None:
+    """A finite number from the center file, or None if the entry is absent."""
+    if value is None:
+        return None
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CenterError(f"{CENTER_FILE}: {name} is not a number")
+
+    try:
+        number = float(value)
+    except OverflowError:
+        number = math.inf
+
+    if not math.isfinite(number):
+        raise CenterError(f"{CENTER_FILE}: {name} is not a usable number")
+
+    return number
 
 
 def save_center(center: Center) -> None:
     """Write the center file."""
-    payload = {
+    payload: dict[str, float | bool] = {
         "motor1": center.motor1,
         "motor2": center.motor2,
         "flip1": center.flip1,
         "flip2": center.flip2,
+        "flip_v": center.flip_rail,
     }
+    if center.rail is not None:
+        payload["arm_v"] = center.rail
+    if center.rail_mm_per_rev is not None:
+        payload["arm_v_mm_per_rev"] = center.rail_mm_per_rev
     # Write a new file and swap it in, so a crash or power cut part-way
     # cannot leave an empty or half-written center file.
     temporary = CENTER_FILE.with_name(CENTER_FILE.name + ".tmp")
@@ -815,17 +887,28 @@ def save_center(center: Center) -> None:
         raise CenterError(f"Cannot write {CENTER_FILE}: {error}") from error
 
 
-def parse_flip(text: str) -> tuple[bool, bool]:
-    """Turn '1', '2', '1,2' or 'none' into (flip1, flip2)."""
+_FLIP_NAMES = {
+    "1": 0, "roll": 0, "arm_roll": 0,
+    "2": 1, "twist": 1, "arm_twist": 1,
+    "3": 2, "v": 2, "arm_v": 2, "rail": 2,
+}
+
+
+def parse_flip(text: str) -> tuple[bool, bool, bool]:
+    """Turn 'roll', 'twist,v', '1,2', 'none' ... into (roll, twist, v) flips."""
     cleaned = text.strip().lower()
     if cleaned == "none":
-        return False, False
+        return False, False, False
 
-    parts = {part.strip() for part in cleaned.split(",") if part.strip()}
-    if not parts or not parts <= {"1", "2"}:
-        raise CenterError("--flip takes 1, 2, 1,2 or none")
+    parts = [part.strip() for part in cleaned.split(",") if part.strip()]
+    if not parts or any(part not in _FLIP_NAMES for part in parts):
+        raise CenterError(
+            "--flip takes roll, twist, v (or 1, 2, 3), several with commas, "
+            "or none"
+        )
 
-    return "1" in parts, "2" in parts
+    chosen = {_FLIP_NAMES[part] for part in parts}
+    return 0 in chosen, 1 in chosen, 2 in chosen
 
 
 # --------------------------------------------------------------------------
@@ -944,6 +1027,22 @@ class Source:
                     return Reading(motor1, motor2, as5600)
 
         return Reading(motor1, motor2, as5600)
+
+    def discard_waiting(self) -> None:
+        """Forget readings received before now, so the next one is fresh."""
+        self._queued.clear()
+
+        if not self._streaming:
+            return
+
+        # The stream firmware keeps sending while nobody reads. Read until
+        # the port hands over only a few lines at a time again: that is the
+        # live stream, not the backlog.
+        deadline = time.monotonic() + 2.0
+
+        while time.monotonic() < deadline:
+            if len(self._lines(0.1)) <= 5:
+                break
 
     def next(self) -> Reading:
         """Block until the next reading is available."""
@@ -1070,10 +1169,102 @@ def connect(port: str | None, backend: str) -> tuple[SerialLink, Source, str]:
     )
 
 
-def record_center(source: Source, flip1: bool, flip2: bool) -> Center:
-    """Average a few readings of each motor and return them as the center."""
+def wrap180(degrees: float) -> float:
+    """The same angle expressed between -180 (inclusive) and 180."""
+    return (degrees + 180.0) % 360.0 - 180.0
+
+
+def circular_mean(angles: list[float]) -> float:
+    """Average of angles in degrees that copes with the 359 -> 0 wrap."""
+    east = sum(math.cos(math.radians(angle)) for angle in angles)
+    north = sum(math.sin(math.radians(angle)) for angle in angles)
+    return math.degrees(math.atan2(north, east)) % 360.0
+
+
+class RailTracker:
+    """Turns the AS5600's 0-360 angle into one that keeps counting turns.
+
+    The rail's gear goes round many times over the rail's travel, and the
+    sensor only knows the angle within one turn. This adds up the changes
+    between readings, so the result keeps growing (or shrinking) past 360.
+    It assumes the gear moves less than half a turn between two readings,
+    and that it starts within half a turn of the zero.
+
+    uncertain becomes True (and one warning is printed) when that can no
+    longer be relied on: the gear seemed to jump more than a third of a
+    turn, or two readings were too far apart in time. The count may then be
+    off by whole turns until the rail is centered again.
+    """
+
+    def __init__(self, zero: float | None) -> None:
+        self._zero = zero
+        self._last: float | None = None
+        self._last_time: float | None = None
+        self._total = 0.0
+        self.uncertain = False
+
+    def update(self, angle: float, time_s: float | None = None) -> float:
+        """Feed one sensor angle and when it was read (seconds, optional).
+
+        Returns the continuous angle (nan if none).
+        """
+        if math.isnan(angle):
+            return math.nan
+
+        if self._last is None:
+            # First reading: the position nearest the zero, or the plain
+            # sensor angle when there is no zero.
+            self._total = angle if self._zero is None else wrap180(angle - self._zero)
+        else:
+            step = wrap180(angle - self._last)
+            self._total += step
+
+            if abs(step) > RAIL_SUSPECT_STEP_DEG:
+                self._doubt(
+                    f"its gear turned {abs(step):.0f} degrees between two readings"
+                )
+            elif (
+                time_s is not None
+                and self._last_time is not None
+                and time_s - self._last_time > RAIL_SUSPECT_GAP_S
+            ):
+                self._doubt(
+                    f"two rail readings were {time_s - self._last_time:.2f} s apart"
+                )
+
+        self._last = angle
+        self._last_time = time_s
+        return self._total
+
+    def _doubt(self, why: str) -> None:
+        """Remember, and say once, that whole turns may have been miscounted."""
+        if self.uncertain:
+            return
+        self.uncertain = True
+        print(
+            f"Warning: arm_v may now be off by whole gear turns ({why}). The "
+            "rail sensor must be read at least twice per half turn of its "
+            "gear: read faster (or use start() and latest()), or move the "
+            "rail slower, then center again.",
+            file=sys.stderr,
+        )
+
+
+def record_center(source: Source, previous: Center | None) -> tuple[Center, bool]:
+    """Average a few readings of each encoder and return them as the center.
+
+    Both motors must answer. The rail (AS5600) is centered too when it has a
+    reading; otherwise its earlier zero, if any, is kept. Signs and the
+    rail's millimetres-per-turn carry over from the previous center.
+
+    Returns the center and whether the rail was measured this time.
+    """
+    # Readings from before this call belong to an earlier pose.
+    source.discard_waiting()
+
     samples1: list[float] = []
     samples2: list[float] = []
+    rail_samples: list[float] = []
     deadline = time.monotonic() + CENTER_TIMEOUT_S
 
     while time.monotonic() < deadline:
@@ -1082,6 +1273,8 @@ def record_center(source: Source, flip1: bool, flip2: bool) -> Center:
             samples1.append(reading.motor1)
         if not math.isnan(reading.motor2) and len(samples2) < CENTER_SAMPLES:
             samples2.append(reading.motor2)
+        if not math.isnan(reading.as5600) and len(rail_samples) < CENTER_SAMPLES:
+            rail_samples.append(reading.as5600)
         if len(samples1) >= CENTER_SAMPLES and len(samples2) >= CENTER_SAMPLES:
             break
 
@@ -1095,9 +1288,23 @@ def record_center(source: Source, flip1: bool, flip2: bool) -> Center:
             f"{' and '.join(missing)} did not answer, so the center was not saved."
         )
 
-    return Center(
-        sum(samples1) / len(samples1), sum(samples2) / len(samples2), flip1, flip2
+    rail_measured = bool(rail_samples)
+
+    if rail_measured:
+        rail: float | None = circular_mean(rail_samples)
+    else:
+        rail = previous.rail if previous is not None else None
+
+    center = Center(
+        sum(samples1) / len(samples1),
+        sum(samples2) / len(samples2),
+        previous.flip1 if previous else False,
+        previous.flip2 if previous else False,
+        rail,
+        previous.flip_rail if previous else False,
+        previous.rail_mm_per_rev if previous else None,
     )
+    return center, rail_measured
 
 
 def relative(value: float, zero: float, flip: bool) -> float:
@@ -1113,17 +1320,43 @@ def relative(value: float, zero: float, flip: bool) -> float:
 
 @dataclass(frozen=True)
 class Angles:
-    """One reading, in degrees.
+    """One reading of the three encoders.
 
-    motor1 and motor2 are measured from the saved center (or are the drivers'
-    own angles if there is no center, or raw=True). A value is nan when that
-    encoder did not answer: test with math.isnan().
+    arm_roll    wrist roll motor (MKS 1), degrees from the saved center
+    arm_twist   wrist twist motor (MKS 2), degrees from the saved center
+    arm_v       the linear rail: degrees of its gear from the saved center,
+                counted across full turns, or millimetres when the center
+                file has a millimetres-per-turn value
+
+    gear_deg    the rail sensor's own angle, 0 to 360, never re-zeroed,
+                flipped or scaled
+
+    With no saved center, or raw=True, arm_roll and arm_twist are the
+    drivers' own angles. When no rail zero is in use (no center, a center
+    saved without a rail reading, or raw=True) arm_v starts at the sensor's
+    own angle instead of 0 and counts turns from there. A value is nan when
+    that encoder did not answer: test with math.isnan().
     """
 
     time_s: float  # seconds since the stream was opened
-    motor1: float
-    motor2: float
-    as5600: float
+    arm_roll: float
+    arm_twist: float
+    arm_v: float
+    gear_deg: float = math.nan
+
+    # The earlier names, kept so existing code keeps working.
+    @property
+    def motor1(self) -> float:
+        return self.arm_roll
+
+    @property
+    def motor2(self) -> float:
+        return self.arm_twist
+
+    @property
+    def as5600(self) -> float:
+        # As before: the sensor's own single-turn angle, not arm_v.
+        return self.gear_deg
 
 
 class EncoderStream:
@@ -1158,6 +1391,10 @@ class EncoderStream:
         self._link, self._source, self.port = connect(port, backend)
         self._start = time.perf_counter()
         self._board_zero: tuple[int, float] | None = None
+        self._rail = RailTracker(self._rail_zero())
+        # Whether the last set_center() measured the rail (False: its sensor
+        # had no reading, so an earlier rail zero, if any, was kept).
+        self.rail_was_centered = False
 
         self._lock = threading.Lock()
         self._latest: Angles | None = None
@@ -1187,35 +1424,93 @@ class EncoderStream:
         """The center in use (None if none is saved)."""
         return self._center
 
-    def set_center(self) -> Center:
-        """Save the current pose as zero. Hold the arm still: takes about a second."""
-        self._require_foreground("set_center()")
-        flip1 = self._center.flip1 if self._center else False
-        flip2 = self._center.flip2 if self._center else False
-        center = record_center(self._source, flip1, flip2)
+    def _rail_zero(self) -> float | None:
+        """The rail's zero angle in use (None in raw mode or if not centered)."""
+        if self._raw or self._center is None:
+            return None
+        return self._center.rail
+
+    @property
+    def rail_uncertain(self) -> bool:
+        """True once arm_v may be off by whole gear turns (center again)."""
+        return self._rail.uncertain
+
+    def _use(self, center: Center, *, new_rail_zero: bool) -> None:
+        """Save a center and start using it.
+
+        The rail's turn count starts again only when its zero was measured
+        anew; a change of sign or unit keeps the turns counted so far.
+        """
         save_center(center)
         self._center = center
+        if new_rail_zero and not self._raw:
+            self._rail = RailTracker(self._rail_zero())
+
+    def set_center(self) -> Center:
+        """Save the current pose as zero. Hold the arm still: takes about a second.
+
+        Both motors must answer. The rail is centered too if its sensor has a
+        reading: rail_was_centered says so afterwards. If it has none, the
+        rail keeps its earlier zero (center.rail stays None if it never had one).
+        """
+        self._require_foreground("set_center()")
+        center, rail_measured = record_center(self._source, self._center)
+        self.rail_was_centered = rail_measured
+        self._use(center, new_rail_zero=rail_measured)
         return center
 
-    def set_flip(self, flip1: bool, flip2: bool) -> None:
-        """Reverse the sign of motor 1 and/or motor 2, and save the choice."""
+    def set_flip(
+        self, flip1: bool, flip2: bool, flip_rail: bool | None = None
+    ) -> None:
+        """Reverse the sign of arm_roll, arm_twist and/or arm_v, and save it.
+
+        Leave flip_rail out (None) to keep the rail's saved sign.
+        """
+        self._require_foreground("set_flip()")
         if self._center is None:
             raise CenterError("Set a center first (set_center() or --center).")
-        self._center = Center(
-            self._center.motor1, self._center.motor2, flip1, flip2
+        old = self._center
+        self._use(
+            Center(
+                old.motor1, old.motor2, flip1, flip2,
+                old.rail,
+                old.flip_rail if flip_rail is None else flip_rail,
+                old.rail_mm_per_rev,
+            ),
+            new_rail_zero=False,
         )
-        save_center(self._center)
+
+    def set_rail_mm_per_rev(self, mm_per_rev: float | None) -> None:
+        """Rail travel for one turn of its gear, in millimetres, and save it.
+
+        arm_v is then reported in millimetres. None goes back to degrees.
+        """
+        self._require_foreground("set_rail_mm_per_rev()")
+        if self._center is None:
+            raise CenterError("Set a center first (set_center() or --center).")
+        if mm_per_rev is not None and not (
+            math.isfinite(mm_per_rev) and mm_per_rev > 0
+        ):
+            raise CenterError("Millimetres per gear turn must be above zero.")
+        old = self._center
+        self._use(
+            Center(
+                old.motor1, old.motor2, old.flip1, old.flip2,
+                old.rail, old.flip_rail, mm_per_rev,
+            ),
+            new_rail_zero=False,
+        )
+
+    @property
+    def arm_v_unit(self) -> str:
+        """'mm' or 'deg': what arm_v is measured in."""
+        center = None if self._raw else self._center
+        return "mm" if center is not None and center.rail_mm_per_rev else "deg"
 
     # -- reading -------------------------------------------------------------
 
     def _convert(self, reading: Reading) -> Angles:
         center = None if self._raw else self._center
-
-        if center is None:
-            motor1, motor2 = reading.motor1, reading.motor2
-        else:
-            motor1 = relative(reading.motor1, center.motor1, center.flip1)
-            motor2 = relative(reading.motor2, center.motor2, center.flip2)
 
         time_s = time.perf_counter() - self._start
 
@@ -1227,7 +1522,21 @@ class EncoderStream:
             first_ms, first_s = self._board_zero
             time_s = first_s + ((reading.board_ms - first_ms) & 0xFFFFFFFF) / 1000.0
 
-        return Angles(time_s, motor1, motor2, reading.as5600)
+        # The rail's gear turns many times: keep counting across turns.
+        arm_v = self._rail.update(reading.as5600, time_s)
+
+        if center is None:
+            motor1, motor2 = reading.motor1, reading.motor2
+        else:
+            motor1 = relative(reading.motor1, center.motor1, center.flip1)
+            motor2 = relative(reading.motor2, center.motor2, center.flip2)
+
+            if center.flip_rail:
+                arm_v = -arm_v
+            if center.rail_mm_per_rev is not None:
+                arm_v = arm_v / 360.0 * center.rail_mm_per_rev
+
+        return Angles(time_s, motor1, motor2, arm_v, reading.as5600)
 
     def _require_foreground(self, what: str) -> None:
         if self._thread is not None:
@@ -1294,20 +1603,48 @@ class EncoderStream:
 
 
 def fmt(value: float) -> str:
-    """Format an angle for the CSV."""
-    return "nan" if math.isnan(value) else f"{value:.3f}"
+    """Format a value to three decimals ('nan' for a missing one)."""
+    if math.isnan(value):
+        return "nan"
+    text = f"{value:.3f}"
+    return "0.000" if text == "-0.000" else text
 
 
-def print_stream(encoders: EncoderStream) -> None:
-    """Print readings as CSV until interrupted."""
-    print(HEADER, flush=True)
+def _json_number(value: float) -> float | None:
+    """JSON has no nan: a missing value becomes null."""
+    return None if math.isnan(value) else round(value, 3) + 0.0
+
+
+def print_stream(encoders: EncoderStream, style: str) -> None:
+    """Print readings until interrupted, as 'csv', 'labeled' or 'json'."""
+    if style == "csv":
+        print(HEADER, flush=True)
 
     for angles in encoders:
-        print(
-            f"{round(angles.time_s * 1000)},{fmt(angles.motor1)},"
-            f"{fmt(angles.motor2)},{fmt(angles.as5600)}",
-            flush=True,
-        )
+        time_ms = round(angles.time_s * 1000)
+
+        if style == "json":
+            line = json.dumps(
+                {
+                    "time_ms": time_ms,
+                    "arm_roll": _json_number(angles.arm_roll),
+                    "arm_twist": _json_number(angles.arm_twist),
+                    "arm_v": _json_number(angles.arm_v),
+                }
+            )
+        elif style == "labeled":
+            line = (
+                f"time_ms={time_ms:<8} arm_roll={fmt(angles.arm_roll):>9} "
+                f"arm_twist={fmt(angles.arm_twist):>9} "
+                f"arm_v={fmt(angles.arm_v):>9}"
+            )
+        else:
+            line = (
+                f"{time_ms},{fmt(angles.arm_roll)},"
+                f"{fmt(angles.arm_twist)},{fmt(angles.arm_v)}"
+            )
+
+        print(line, flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1326,8 +1663,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--flip",
-        metavar="MOTORS",
-        help="reverse the sign of these motors and save it: 1, 2, 1,2 or none",
+        metavar="WHICH",
+        help="reverse the sign of these and save it: roll, twist, v (several "
+        "with commas), or none",
+    )
+    parser.add_argument(
+        "--rail-mm-per-rev",
+        type=float,
+        metavar="MM",
+        help="rail travel for one turn of its gear, in millimetres (saved); "
+        "arm_v is then in millimetres. 0 goes back to degrees",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("csv", "labeled", "json"),
+        default="csv",
+        help="how each reading is printed (default: csv)",
     )
     parser.add_argument(
         "--raw", action="store_true", help="print the drivers' own angles, no center"
@@ -1351,6 +1702,8 @@ def main() -> int:
     flip_arg: str | None = args.flip
     raw: bool = args.raw
     backend: str = args.backend
+    style: str = args.format
+    mm_per_rev: float | None = args.rail_mm_per_rev
 
     if args.list:
         ports = candidate_ports()
@@ -1369,23 +1722,65 @@ def main() -> int:
 
         if want_center:
             center = encoders.set_center()
+            if center.rail is None:
+                rail_text = "not centered (the rail sensor has no reading)"
+            elif encoders.rail_was_centered:
+                rail_text = f"{center.rail:.3f}"
+            else:
+                rail_text = (
+                    f"{center.rail:.3f}, kept from the earlier center "
+                    "because the rail sensor has no reading now"
+                )
             print(
-                f"Center saved: motor 1 = {center.motor1:.3f}, "
-                f"motor 2 = {center.motor2:.3f} (driver angles)",
+                f"Center saved: arm_roll = {center.motor1:.3f}, "
+                f"arm_twist = {center.motor2:.3f}, arm_v = {rail_text} "
+                "(the encoders' own angles)",
                 file=sys.stderr,
             )
 
         if flips is not None:
-            encoders.set_flip(flips[0], flips[1])
-
-        if encoders.center is None and not raw:
+            encoders.set_flip(flips[0], flips[1], flips[2])
+            flipped = [
+                name
+                for name, on in zip(("arm_roll", "arm_twist", "arm_v"), flips)
+                if on
+            ]
             print(
-                "No center saved yet: showing the drivers' own angles. "
-                "Run with --center at the center pose.",
+                "Signs reversed now: " + (", ".join(flipped) or "none")
+                + " (--flip replaces the saved choice for all three).",
                 file=sys.stderr,
             )
 
-        print_stream(encoders)
+        if mm_per_rev is not None:
+            encoders.set_rail_mm_per_rev(mm_per_rev if mm_per_rev != 0 else None)
+
+        saved = encoders.center
+
+        if saved is None and not raw:
+            print(
+                "No center saved yet: showing the encoders' own angles. "
+                "Run with --center at the center pose.",
+                file=sys.stderr,
+            )
+        elif saved is not None and saved.rail is None and not raw:
+            print(
+                "The rail has no center yet: arm_v is its sensor's own angle, "
+                "not measured from the center. Run with --center while the "
+                "rail sensor sees its magnet.",
+                file=sys.stderr,
+            )
+
+        print(
+            "arm_roll, arm_twist: degrees. arm_v: "
+            + (
+                "millimetres of rail travel."
+                if encoders.arm_v_unit == "mm"
+                else "degrees of the rail's gear (counted across turns)."
+            ),
+            file=sys.stderr,
+        )
+
+        print_stream(encoders, style)
     except KeyboardInterrupt:
         # End the "^C" line on the terminal, not in the CSV on stdout.
         print(file=sys.stderr)

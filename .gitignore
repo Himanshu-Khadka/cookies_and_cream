@@ -30,3 +30,7 @@ Thumbs.db
 
 # Cloned upstream arm repo (URDF lives here)
 hardware_test/SO-ARM100/
+
+# Saved encoder center: specific to one power-up of the drivers
+lib/center.json
+lib/center.json.tmp
