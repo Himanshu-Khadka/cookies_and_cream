@@ -16,6 +16,7 @@
 //   speed 300  set the step rate in steps per second
 //   hold 1     switch motor 1 on and hold it (60 s max)
 //   r          read all three encoders once
+//   i2c        test the AS5600 wires and show its magnet status
 //   x          release (switch off) both motors
 //   help       list the commands
 //
@@ -39,6 +40,10 @@ Uart MKS2(PA3, PA2);             // RX, TX
 constexpr uint32_t SDA_PIN = PB7;
 constexpr uint32_t SCL_PIN = PB6;
 constexpr uint8_t AS5600_ADDR = 0x36;
+constexpr uint32_t I2C_CLOCK_HZ = 100000;
+
+// After a failed read, try to free the bus at most this often.
+constexpr uint32_t I2C_RECOVERY_INTERVAL_MS = 1000;
 
 // ============================================
 // CONFIGURATION
@@ -391,26 +396,235 @@ void scanDriver(Motor &motor) {
 }
 
 // ============================================
-// AS5600
+// I2C BUS AND AS5600
 // ============================================
 
-bool readAS5600(double &degrees) {
+uint32_t lastI2cRecoveryMs = 0;
+
+// Why the last AS5600 reading failed (nullptr = it worked).
+const char* as5600Problem = nullptr;
+
+// Switch on the chip's own pull-up resistor for a pin without changing
+// what the pin is used for.
+void enablePullUp(uint32_t pin) {
+  PinName name = digitalPinToPinName(pin);
+  LL_GPIO_SetPinPull(get_GPIO_Port(STM_PORT(name)),
+                     STM_LL_GPIO_PIN(name), LL_GPIO_PULL_UP);
+}
+
+// Start I2C with pull-ups on SDA and SCL. The core leaves them off and
+// the Black Pill has no pull-up resistors of its own, so a sensor board
+// without them would leave both lines floating: every read then comes
+// back as zeros, or fails.
+void beginI2c() {
+  Wire.setSDA(SDA_PIN);
+  Wire.setSCL(SCL_PIN);
+  Wire.begin();
+  Wire.setClock(I2C_CLOCK_HZ);
+  enablePullUp(SDA_PIN);
+  enablePullUp(SCL_PIN);
+}
+
+void releaseLine(uint32_t pin) {
+  pinMode(pin, INPUT_PULLUP);
+}
+
+void pullLineLow(uint32_t pin) {
+  pinMode(pin, OUTPUT_OPEN_DRAIN);
+  digitalWrite(pin, LOW);
+}
+
+// Free a bus that the sensor is holding. A sensor whose power dipped
+// in the middle of a byte keeps SDA low and waits for clock pulses
+// that never come: clock SCL by hand until it lets go, send a STOP,
+// then restart the I2C peripheral.
+void recoverI2c() {
+  Wire.end();
+
+  releaseLine(SDA_PIN);
+  releaseLine(SCL_PIN);
+  delayMicroseconds(50);
+
+  for (int i = 0; i < 9 && digitalRead(SDA_PIN) == LOW; i++) {
+    pullLineLow(SCL_PIN);
+    delayMicroseconds(50);
+    releaseLine(SCL_PIN);
+    delayMicroseconds(50);
+  }
+
+  // STOP condition: SDA rises while SCL is high.
+  pullLineLow(SDA_PIN);
+  delayMicroseconds(50);
+  releaseLine(SCL_PIN);
+  delayMicroseconds(50);
+  releaseLine(SDA_PIN);
+  delayMicroseconds(50);
+
+  beginI2c();
+  lastI2cRecoveryMs = millis();
+}
+
+bool readAS5600Registers(uint8_t firstRegister, uint8_t* values, uint8_t count) {
   Wire.beginTransmission(AS5600_ADDR);
-  Wire.write(0x0C);
+  Wire.write(firstRegister);
 
   if (Wire.endTransmission(false) != 0) {
     return false;
   }
 
-  if (Wire.requestFrom(AS5600_ADDR, (uint8_t)2) != 2) {
+  if (Wire.requestFrom(AS5600_ADDR, count) != count) {
     return false;
   }
 
-  uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
-  raw &= 0x0FFF;
+  for (uint8_t i = 0; i < count; i++) {
+    values[i] = (uint8_t)Wire.read();
+  }
 
-  degrees = raw * 360.0 / 4096.0;
   return true;
+}
+
+// One attempt: status (is a magnet there?) and the raw angle.
+bool tryReadAS5600(double &degrees) {
+  uint8_t status = 0;
+  uint8_t angle[2] = { 0, 0 };
+
+  if (!readAS5600Registers(0x0B, &status, 1) ||
+      !readAS5600Registers(0x0C, angle, sizeof(angle))) {
+    as5600Problem = "no reply";
+    return false;
+  }
+
+  // Bit 5 of the status register: magnet detected. Without a magnet
+  // the angle the sensor reports means nothing.
+  if ((status & 0x20) == 0) {
+    as5600Problem = "no magnet detected";
+    return false;
+  }
+
+  uint16_t raw = (((uint16_t)angle[0] << 8) | angle[1]) & 0x0FFF;
+  degrees = raw * 360.0 / 4096.0;
+  as5600Problem = nullptr;
+  return true;
+}
+
+bool readAS5600(double &degrees) {
+  if (tryReadAS5600(degrees)) {
+    return true;
+  }
+
+  // The sensor did not answer: free the bus and ask once more, but not
+  // on every call, so a missing sensor does not slow everything down.
+  bool noAnswer = (as5600Problem != nullptr && as5600Problem[0] == 'n' &&
+                   as5600Problem[3] == 'r');
+
+  if (noAnswer &&
+      (lastI2cRecoveryMs == 0 ||
+       millis() - lastI2cRecoveryMs > I2C_RECOVERY_INTERVAL_MS)) {
+    recoverI2c();
+    return tryReadAS5600(degrees);
+  }
+
+  return false;
+}
+
+// What an idle line reads with the chip's pull-down, then its pull-up.
+void describeLine(const char* name, uint32_t pin) {
+  pinMode(pin, INPUT_PULLDOWN);
+  delay(2);
+  bool highWithPullDown = (digitalRead(pin) == HIGH);
+
+  pinMode(pin, INPUT_PULLUP);
+  delay(2);
+  bool highWithPullUp = (digitalRead(pin) == HIGH);
+
+  Serial.print(name);
+  Serial.print(" (");
+  Serial.print(pin == SDA_PIN ? "PB7" : "PB6");
+  Serial.print("): ");
+
+  if (highWithPullDown) {
+    Serial.println("held HIGH from outside: pull-up resistors present, good");
+  } else if (highWithPullUp) {
+    Serial.println("FLOATING: nothing outside pulls it up (wire not connected, sensor unpowered, or no pull-up resistors on the sensor board)");
+  } else {
+    Serial.println("stuck LOW: shorted to ground, or the sensor is holding it");
+  }
+}
+
+// "i2c": test the two wires, look for devices, and show the AS5600's
+// own view of its magnet.
+void i2cSelfTest() {
+  Wire.end();
+  describeLine("SDA", SDA_PIN);
+  describeLine("SCL", SCL_PIN);
+  recoverI2c();
+
+  int found = 0;
+  bool sensorFound = false;
+
+  Serial.print("devices answering:");
+
+  for (uint8_t address = 0x08; address <= 0x77; address++) {
+    Wire.beginTransmission(address);
+
+    if (Wire.endTransmission() == 0) {
+      found++;
+      if (address == AS5600_ADDR) sensorFound = true;
+
+      if (found <= 8) {
+        Serial.print(" 0x");
+        if (address < 0x10) Serial.print("0");
+        Serial.print(address, HEX);
+      }
+    }
+  }
+
+  if (found == 0) {
+    Serial.println(" none");
+  } else if (found > 8) {
+    Serial.print(" ... ");
+    Serial.print(found);
+    Serial.println(" addresses (a bus where everything answers is stuck low or has no pull-ups)");
+  } else {
+    Serial.println();
+  }
+
+  if (!sensorFound) {
+    Serial.println("AS5600 (address 0x36) did not answer: check its VCC (3.3V), GND, SDA to PB7 and SCL to PB6");
+    Serial.println("ok");
+    return;
+  }
+
+  uint8_t status = 0;
+  uint8_t agc = 0;
+  uint8_t magnitude[2] = { 0, 0 };
+  uint8_t angle[2] = { 0, 0 };
+
+  if (!readAS5600Registers(0x0B, &status, 1) ||
+      !readAS5600Registers(0x1A, &agc, 1) ||
+      !readAS5600Registers(0x1B, magnitude, sizeof(magnitude)) ||
+      !readAS5600Registers(0x0C, angle, sizeof(angle))) {
+    Serial.println("AS5600 answered the scan but not the register reads");
+    Serial.println("ok");
+    return;
+  }
+
+  Serial.print("AS5600 found. magnet detected: ");
+  Serial.println((status & 0x20) ? "yes" : "NO");
+
+  if (status & 0x10) Serial.println("magnet too weak or too far from the chip");
+  if (status & 0x08) Serial.println("magnet too strong or too close to the chip");
+
+  Serial.print("status 0x");
+  if (status < 0x10) Serial.print("0");
+  Serial.print(status, HEX);
+  Serial.print(", gain ");
+  Serial.print(agc);
+  Serial.print(", field strength ");
+  Serial.print((((uint16_t)magnitude[0] << 8) | magnitude[1]) & 0x0FFF);
+  Serial.print(", raw angle ");
+  Serial.println((((uint16_t)angle[0] << 8) | angle[1]) & 0x0FFF);
+  Serial.println("ok");
 }
 
 // ============================================
@@ -439,7 +653,7 @@ void printEncoders() {
     Serial.print(degrees, 3);
     Serial.println(" deg");
   } else {
-    Serial.println("no reply");
+    Serial.println(as5600Problem != nullptr ? as5600Problem : "no reply");
   }
 }
 
@@ -675,6 +889,7 @@ void printHelp() {
   Serial.println("status <1|2> what the driver reports about itself");
   Serial.println("probe <1|2>  find which board pins EN/STEP/DIR are wired to");
   Serial.println("r            read all three encoders");
+  Serial.println("i2c          test the AS5600 wires and show its magnet status");
   Serial.println("x            release both motors");
 }
 
@@ -816,6 +1031,11 @@ void handleLine(String line) {
   if (line == "r") {
     printEncoders();
     Serial.println("ok");
+    return;
+  }
+
+  if (line == "i2c") {
+    i2cSelfTest();
     return;
   }
 
@@ -989,10 +1209,7 @@ void setup() {
   MKS1.begin(UART_BAUD, SERIAL_8N1);
   MKS2.begin(UART_BAUD, SERIAL_8N1);
 
-  Wire.setSDA(SDA_PIN);
-  Wire.setSCL(SCL_PIN);
-  Wire.begin();
-  Wire.setClock(100000);
+  beginI2c();
 }
 
 void loop() {
