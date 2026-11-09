@@ -87,25 +87,54 @@ def go_home(arm, home, speed, tolerance, max_lag):
         time.sleep(max(0, 1 / 30 - (time.monotonic() - now)))
 
 
+
 def run(args):
     arm = SimulatedArm("follower") if args.simulate else RealArm(
-        "follower", args.port, args.id)
+        "follower", args.port, args.id
+    )
+
+    homed = False
+
     try:
         home = home_pose(arm.calibration, args.pose)
-        print(f"{'SIMULATION | ' if args.simulate else ''}Moving to '{args.pose}' home at "
-              f"{args.speed:g} deg/s: " + ", ".join(f"{j} {home[j]:.1f}" for j in BODY)
-              + "\nCtrl+C stops and releases torque.", flush=True)
+
+        print(
+            f"{'SIMULATION | ' if args.simulate else ''}"
+            f"Moving to '{args.pose}' home at {args.speed:g} deg/s: "
+            + ", ".join(f"{j} {home[j]:.1f}" for j in BODY),
+            flush=True
+        )
+
         arm.prepare_teleoperation()
+
         go_home(arm, home, args.speed, args.tolerance, args.max_lag)
+
+        # Only set this after go_home successfully finishes.
+        homed = True
+
         if not args.simulate:
-            input("Holding home. Support the arm, then press Enter to release torque> ")
+            if args.keep_torque:
+                print("Home reached. Keeping motor torque enabled.")
+            else:
+                input(
+                    "Holding home. Support the arm, then press Enter "
+                    "to release torque> "
+                )
+
     finally:
+        if not args.simulate and args.keep_torque and homed:
+            # RealArm.close() normally disables torque when
+            # self.teleoperating is True. Setting it False makes
+            # close() disconnect without releasing motor torque.
+            arm.teleoperating = False
+
         arm.close()
+
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", default="/dev/tty.usbmodem5C4C1241631")
+    parser.add_argument("--port", default="/dev/ttyACM0")
     parser.add_argument("--id", default="my_follower", help="Saved follower calibration ID")
     parser.add_argument("--pose", choices=("range", "calibration"), default="range",
                         help="range: midpoint of saved limits; calibration: pose held while calibrating")
@@ -115,6 +144,11 @@ def main(argv=None):
     parser.add_argument("--max-lag", type=float, default=12,
                         help="Degrees a target may lead the measured joint (more = more lifting torque)")
     parser.add_argument("--simulate", action="store_true", help="Try without connecting hardware")
+    parser.add_argument(
+    "--keep-torque",
+    action="store_true",
+    help="Keep the motors energized after successful homing for the next script"
+)
     args = parser.parse_args(argv)
     if not math.isfinite(args.speed) or args.speed <= 0:
         parser.error("--speed must be finite and positive")
