@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read the arm's three encoders from the Black Pill: print them, or import them.
+"""Read the controller from the Black Pill: print the stream, or import it.
 
 One labeled stream:
 
@@ -8,6 +8,13 @@ One labeled stream:
     arm_v       the linear rail (white AS5600 on the rail's small gear),
                 degrees of that gear from the saved center, counted across
                 full turns; or millimetres once --rail-mm-per-rev is set
+    joy_x       joystick X (A4), -1.0 .. +1.0, 0 = middle
+    joy_y       joystick Y (A5), -1.0 .. +1.0, 0 = middle
+    button      switch (B9), 1 = pressed, 0 = not
+    trigger     trigger (B10), 1 = on, 0 = off
+
+The joystick, button and trigger come from firmware/controller; with older
+firmware those values are nan (button and trigger: None).
 
 Runs on Windows, macOS and Linux with nothing to install: it only needs
 Python 3.8 or newer. (If pyserial happens to be installed it can be used
@@ -26,8 +33,12 @@ PRINT THE STREAM (run this file):
     python read_encoders.py --raw              the drivers' own angles, no center
     python read_encoders.py --list             list the serial ports it can see
     python read_encoders.py COM5               use this port (or /dev/ttyACM0, ...)
+    python read_encoders.py --stlink           read through the ST-Link instead of
+                                               USB (needs read_controller.py and
+                                               read_trigger.py next to this file)
 
-CSV output is: time_ms,arm_roll,arm_twist,arm_v. Ctrl-C stops it.
+CSV output is: time_ms,arm_roll,arm_twist,arm_v,joy_x,joy_y,button,trigger.
+Ctrl-C stops it.
 
 USE IT FROM YOUR OWN CODE (keep this file next to yours):
 
@@ -35,7 +46,8 @@ USE IT FROM YOUR OWN CODE (keep this file next to yours):
 
     with EncoderStream() as encoders:        # finds the board by itself
         for angles in encoders:              # one Angles per reading, forever
-            print(angles.arm_roll, angles.arm_twist, angles.arm_v)
+            print(angles.arm_roll, angles.arm_twist, angles.arm_v,
+                  angles.joy_x, angles.joy_y, angles.button, angles.trigger)
 
     # or, inside a loop of your own that must not wait for the board:
     encoders = EncoderStream()
@@ -59,9 +71,9 @@ encoders" loop do no slow work between readings; if your loop is slow, use
 start() and latest(), which keep reading in the background. If the count
 may have slipped, a warning is printed once and rail_uncertain becomes True.
 
-Works with either firmware on the board: the encoder stream firmware (which
-sends lines by itself) or the motor test firmware (which is asked for a
-reading about 10 times a second).
+Works with any of the board's firmwares: the controller firmware and the
+encoder stream firmware (which send lines by themselves) or the motor test
+firmware (which is asked for a reading about 10 times a second).
 """
 
 from __future__ import annotations
@@ -76,6 +88,7 @@ import json
 import math
 import os
 import platform
+import signal
 import sys
 import threading
 import time
@@ -83,7 +96,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-HEADER = "time_ms,arm_roll,arm_twist,arm_v"
+HEADER = "time_ms,arm_roll,arm_twist,arm_v,joy_x,joy_y,button,trigger"
 CENTER_FILE = Path(__file__).resolve().parent / "center.json"
 BAUD = 115200
 
@@ -779,12 +792,16 @@ class Center:
 
 @dataclass(frozen=True)
 class Reading:
-    """One set of raw angles in degrees (nan = no answer)."""
+    """One set of raw values from the board (nan / None = not available)."""
 
     motor1: float
     motor2: float
     as5600: float
     board_ms: int | None = None  # the firmware's own clock, when it sends one
+    joy_x: float = math.nan  # -1..+1
+    joy_y: float = math.nan  # -1..+1
+    button: int | None = None  # 1 = pressed
+    trigger: int | None = None  # 1 = on
 
 
 def load_center() -> Center | None:
@@ -925,15 +942,37 @@ def to_angle(text: str) -> float:
     return value if math.isfinite(value) else math.nan
 
 
+def to_switch(text: str) -> int | None:
+    """'1' -> 1, '0' -> 0, anything else -> None."""
+    value = text.strip()
+    return int(value) if value in ("0", "1") else None
+
+
 def parse_stream_line(line: str) -> Reading | None:
-    """Parse a CSV line from the encoder stream firmware."""
+    """Parse a CSV line from the controller firmware (8 values) or the
+    encoder stream firmware (4 values)."""
     parts = line.split(",")
     stamp = parts[0].strip()
-    if len(parts) != 4 or not (stamp.isascii() and stamp.isdigit()):
+    if len(parts) not in (4, 8) or not (stamp.isascii() and stamp.isdigit()):
         return None
-    return Reading(
+
+    reading = Reading(
         to_angle(parts[1]), to_angle(parts[2]), to_angle(parts[3]), int(stamp)
     )
+
+    if len(parts) == 8:
+        reading = Reading(
+            reading.motor1,
+            reading.motor2,
+            reading.as5600,
+            reading.board_ms,
+            joy_x=to_angle(parts[4]),
+            joy_y=to_angle(parts[5]),
+            button=to_switch(parts[6]),
+            trigger=to_switch(parts[7]),
+        )
+
+    return reading
 
 
 def angle_from_reply(line: str) -> float:
@@ -1089,6 +1128,83 @@ def no_port_hint() -> str:
             "--device=/dev/ttyACM0 so it can see the board."
         )
     return ""
+
+
+class ReadingSource(Protocol):
+    """Where readings come from: the USB serial port, or the ST-Link."""
+
+    def next(self) -> Reading:
+        """Block until the next reading is available."""
+        ...
+
+    def discard_waiting(self) -> None:
+        """Forget readings received before now."""
+        ...
+
+
+class Closable(Protocol):
+    def close(self) -> None: ...
+
+
+class StlinkSource:
+    """Readings of the controller firmware, read through the ST-Link (SWD).
+
+    Uses read_controller.py (and read_trigger.py), which must sit next to
+    this file. The board keeps running while it is read.
+    """
+
+    def __init__(self) -> None:
+        try:
+            from read_controller import ControllerReader
+            from read_trigger import TriggerError
+        except ImportError as error:
+            raise PortError(
+                "Reading through the ST-Link needs read_controller.py and "
+                "read_trigger.py next to this file."
+            ) from error
+
+        self._error_type: type[Exception] = TriggerError
+
+        try:
+            self._reader = ControllerReader()
+        except TriggerError as error:
+            raise PortError(str(error)) from error
+
+        self._last_ms: int | None = None
+
+    def next(self) -> Reading:
+        deadline = time.monotonic() + 2.0
+
+        while True:
+            try:
+                r = self._reader.read()
+            except self._error_type as error:
+                raise PortError(str(error)) from error
+
+            if r.time_ms != self._last_ms:
+                self._last_ms = r.time_ms
+                return Reading(
+                    r.arm_roll,
+                    r.arm_twist,
+                    r.arm_v,
+                    r.time_ms,
+                    joy_x=r.joy_x,
+                    joy_y=r.joy_y,
+                    button=r.button,
+                    trigger=r.trigger,
+                )
+
+            if time.monotonic() > deadline:
+                raise PortError("The board stopped sending new readings.")
+
+            time.sleep(0.003)
+
+    def discard_waiting(self) -> None:
+        # Each read is the newest value: nothing is ever queued.
+        return None
+
+    def close(self) -> None:
+        self._reader.close()
 
 
 def connect(port: str | None, backend: str) -> tuple[SerialLink, Source, str]:
@@ -1250,7 +1366,7 @@ class RailTracker:
         )
 
 
-def record_center(source: Source, previous: Center | None) -> tuple[Center, bool]:
+def record_center(source: ReadingSource, previous: Center | None) -> tuple[Center, bool]:
     """Average a few readings of each encoder and return them as the center.
 
     Both motors must answer. The rail (AS5600) is centered too when it has a
@@ -1330,6 +1446,10 @@ class Angles:
 
     gear_deg    the rail sensor's own angle, 0 to 360, never re-zeroed,
                 flipped or scaled
+    joy_x       joystick X, -1.0 .. +1.0 (0 = middle), nan if not available
+    joy_y       joystick Y, -1.0 .. +1.0 (0 = middle), nan if not available
+    button      1 = pressed, 0 = not, None if not available
+    trigger     1 = on, 0 = off, None if not available
 
     With no saved center, or raw=True, arm_roll and arm_twist are the
     drivers' own angles. When no rail zero is in use (no center, a center
@@ -1343,6 +1463,10 @@ class Angles:
     arm_twist: float
     arm_v: float
     gear_deg: float = math.nan
+    joy_x: float = math.nan
+    joy_y: float = math.nan
+    button: int | None = None
+    trigger: int | None = None
 
     # The earlier names, kept so existing code keeps working.
     @property
@@ -1365,6 +1489,8 @@ class EncoderStream:
     port     serial port name, or None to find the board automatically
     raw      True = the drivers' own angles, ignoring any saved center
     backend  "auto", "native" or "pyserial"
+    stlink   True = read through the ST-Link (SWD) instead of USB serial;
+             needs the controller firmware on the board
 
     Raises PortError if the board cannot be found or opened, and CenterError
     if center.json exists but is damaged.
@@ -1377,6 +1503,7 @@ class EncoderStream:
         raw: bool = False,
         backend: str = "auto",
         replace_center: bool = False,
+        stlink: bool = False,
     ) -> None:
         self._raw = raw
         self._center: Center | None = None
@@ -1388,7 +1515,14 @@ class EncoderStream:
             if not (raw or replace_center):
                 raise
             print(f"Warning: {error}", file=sys.stderr)
-        self._link, self._source, self.port = connect(port, backend)
+        self._link: Closable
+        self._source: ReadingSource
+
+        if stlink:
+            source = StlinkSource()
+            self._link, self._source, self.port = source, source, "ST-Link"
+        else:
+            self._link, self._source, self.port = connect(port, backend)
         self._start = time.perf_counter()
         self._board_zero: tuple[int, float] | None = None
         self._rail = RailTracker(self._rail_zero())
@@ -1536,7 +1670,17 @@ class EncoderStream:
             if center.rail_mm_per_rev is not None:
                 arm_v = arm_v / 360.0 * center.rail_mm_per_rev
 
-        return Angles(time_s, motor1, motor2, arm_v, reading.as5600)
+        return Angles(
+            time_s,
+            motor1,
+            motor2,
+            arm_v,
+            reading.as5600,
+            joy_x=reading.joy_x,
+            joy_y=reading.joy_y,
+            button=reading.button,
+            trigger=reading.trigger,
+        )
 
     def _require_foreground(self, what: str) -> None:
         if self._thread is not None:
@@ -1615,6 +1759,11 @@ def _json_number(value: float) -> float | None:
     return None if math.isnan(value) else round(value, 3) + 0.0
 
 
+def fmt_switch(value: int | None) -> str:
+    """1 / 0, or 'nan' when the firmware does not send it."""
+    return "nan" if value is None else str(value)
+
+
 def print_stream(encoders: EncoderStream, style: str) -> None:
     """Print readings until interrupted, as 'csv', 'labeled' or 'json'."""
     if style == "csv":
@@ -1630,18 +1779,27 @@ def print_stream(encoders: EncoderStream, style: str) -> None:
                     "arm_roll": _json_number(angles.arm_roll),
                     "arm_twist": _json_number(angles.arm_twist),
                     "arm_v": _json_number(angles.arm_v),
+                    "joy_x": _json_number(angles.joy_x),
+                    "joy_y": _json_number(angles.joy_y),
+                    "button": angles.button,
+                    "trigger": angles.trigger,
                 }
             )
         elif style == "labeled":
             line = (
                 f"time_ms={time_ms:<8} arm_roll={fmt(angles.arm_roll):>9} "
                 f"arm_twist={fmt(angles.arm_twist):>9} "
-                f"arm_v={fmt(angles.arm_v):>9}"
+                f"arm_v={fmt(angles.arm_v):>9} "
+                f"joy_x={fmt(angles.joy_x):>6} joy_y={fmt(angles.joy_y):>6} "
+                f"button={fmt_switch(angles.button)} "
+                f"trigger={fmt_switch(angles.trigger)}"
             )
         else:
             line = (
                 f"{time_ms},{fmt(angles.arm_roll)},"
-                f"{fmt(angles.arm_twist)},{fmt(angles.arm_v)}"
+                f"{fmt(angles.arm_twist)},{fmt(angles.arm_v)},"
+                f"{fmt(angles.joy_x)},{fmt(angles.joy_y)},"
+                f"{fmt_switch(angles.button)},{fmt_switch(angles.trigger)}"
             )
 
         print(line, flush=True)
@@ -1687,6 +1845,11 @@ def parse_args() -> argparse.Namespace:
         "--list", action="store_true", help="list the serial ports and exit"
     )
     parser.add_argument(
+        "--stlink",
+        action="store_true",
+        help="read through the ST-Link instead of USB (controller firmware)",
+    )
+    parser.add_argument(
         "--backend",
         choices=("auto", "native", "pyserial"),
         default="auto",
@@ -1695,8 +1858,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def install_stop_signals() -> None:
+    """Turn Ctrl-C, a kill and a closed terminal into KeyboardInterrupt, so
+    the port (or OpenOCD, with --stlink) is always closed on the way out."""
+
+    def stop(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is not None:
+            signal.signal(number, stop)
+
+
 def main() -> int:
     args = parse_args()
+    install_stop_signals()
     port_arg: str | None = args.port
     want_center: bool = args.center
     flip_arg: str | None = args.flip
@@ -1704,6 +1881,7 @@ def main() -> int:
     backend: str = args.backend
     style: str = args.format
     mm_per_rev: float | None = args.rail_mm_per_rev
+    stlink: bool = args.stlink
 
     if args.list:
         ports = candidate_ports()
@@ -1716,7 +1894,11 @@ def main() -> int:
         flips = parse_flip(flip_arg) if flip_arg is not None else None
 
         encoders = EncoderStream(
-            port_arg, raw=raw, backend=backend, replace_center=want_center
+            port_arg,
+            raw=raw,
+            backend=backend,
+            replace_center=want_center,
+            stlink=stlink,
         )
         print(f"Connected to {encoders.port}", file=sys.stderr)
 
