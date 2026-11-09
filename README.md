@@ -6,6 +6,47 @@ an AS5600 rail encoder, a joystick, a clutch button, and a PS5 trigger. The
 repository contains the controller firmware, Python tools for reading its input,
 and separate tools for exercising the arm and recording servo telemetry.
 
+## Drive the arm (one command)
+
+[`run_arm.py`](run_arm.py) sets up any computer (macOS, Linux, Windows) and
+starts [`working_code/control_arm.py`](working_code/control_arm.py), which
+drives the SO-101 from the controller. It gets the code if needed, makes a
+`.venv` and installs the packages, fixes Linux serial permissions, finds the
+arm's and the controller's ports, and uses the calibration stored in this repo.
+Needs Python 3.10+ (3.12 recommended) and git.
+
+Plug in the arm's USB and the controller's USB-C, then:
+
+```sh
+python3 run_arm.py              # set up, then dry run: prints, moves nothing
+python3 run_arm.py --live       # set up, then MOVE THE REAL ARM
+```
+
+Other options:
+
+```sh
+python3 run_arm.py --stlink                 # read the controller through the ST-Link instead of USB-C
+python3 run_arm.py --setup-only             # only set up
+python3 run_arm.py --live -- --no-clutch    # anything after -- goes to control_arm.py
+```
+
+| Controller | Arm |
+| --- | --- |
+| Button | Clutch: hold to drive, release to freeze |
+| `arm_twist` (MKS 2) | Base rotation (`shoulder_pan`) |
+| `arm_roll` (MKS 1) | Wrist rotation (`wrist_roll`) |
+| Joystick Y | Forward / back (inverse kinematics; push further = faster) |
+| Rail (`arm_v`) | Up / down (inverse kinematics) |
+| Trigger | Gripper close / open |
+
+Motion starts from wherever the arm is when you press the clutch, so no home
+file is needed. Start with the arm resting or supported, keep a hand on the
+arm's power for the first live run, and press Enter at the end to release the
+motors (hold the arm first). If the gripper works backwards, add
+`-- --gripper-open 100 --gripper-closed 0`. If no button is wired, add
+`-- --no-clutch`. See `python3 working_code/control_arm.py --help` for speeds
+and limits.
+
 ## Try it without hardware
 
 From the repository root, use Python 3.12 to run a simulated homing move, record
