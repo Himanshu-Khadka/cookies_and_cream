@@ -11,10 +11,12 @@ One labeled stream:
     joy_x       joystick X (A4), -1.0 .. +1.0, 0 = middle
     joy_y       joystick Y (A5), -1.0 .. +1.0, 0 = middle
     button      switch (B9), 1 = pressed, 0 = not
-    trigger     trigger (B10), 1 = on, 0 = off
+    trigger     legacy trigger threshold, 1 = >50% travel, 0 = off
+    trigger_percent  analog PS5 trigger 0..100; nan until calibrated
 
 The joystick, button and trigger come from firmware/controller; with older
-firmware those values are nan (button and trigger: None).
+firmware those values are nan (button and trigger: None). The analog percentage
+requires updated CTL2 firmware and a trigger wired to analog pin PA1.
 
 Runs on Windows, macOS and Linux with nothing to install: it only needs
 Python 3.8 or newer. (If pyserial happens to be installed it can be used
@@ -37,7 +39,7 @@ PRINT THE STREAM (run this file):
                                                USB (needs read_controller.py and
                                                read_trigger.py next to this file)
 
-CSV output is: time_ms,arm_roll,arm_twist,arm_v,joy_x,joy_y,button,trigger.
+CSV output is: time_ms,arm_roll,arm_twist,arm_v,joy_x,joy_y,button,trigger,trigger_percent.
 Ctrl-C stops it.
 
 USE IT FROM YOUR OWN CODE (keep this file next to yours):
@@ -96,7 +98,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-HEADER = "time_ms,arm_roll,arm_twist,arm_v,joy_x,joy_y,button,trigger"
+HEADER = "time_ms,arm_roll,arm_twist,arm_v,joy_x,joy_y,button,trigger,trigger_percent"
 CENTER_FILE = Path(__file__).resolve().parent / "center.json"
 BAUD = 115200
 
@@ -801,7 +803,8 @@ class Reading:
     joy_x: float = math.nan  # -1..+1
     joy_y: float = math.nan  # -1..+1
     button: int | None = None  # 1 = pressed
-    trigger: int | None = None  # 1 = on
+    trigger: int | None = None  # legacy 1 = on
+    trigger_percent: float = math.nan  # 0..100; nan if unavailable/unset
 
 
 def load_center() -> Center | None:
@@ -949,18 +952,17 @@ def to_switch(text: str) -> int | None:
 
 
 def parse_stream_line(line: str) -> Reading | None:
-    """Parse a CSV line from the controller firmware (8 values) or the
-    encoder stream firmware (4 values)."""
+    """Parse 9-column CTL2 or 8-column CTL1 controller CSV, or 4-column motor CSV."""
     parts = line.split(",")
     stamp = parts[0].strip()
-    if len(parts) not in (4, 8) or not (stamp.isascii() and stamp.isdigit()):
+    if len(parts) not in (4, 8, 9) or not (stamp.isascii() and stamp.isdigit()):
         return None
 
     reading = Reading(
         to_angle(parts[1]), to_angle(parts[2]), to_angle(parts[3]), int(stamp)
     )
 
-    if len(parts) == 8:
+    if len(parts) in (8, 9):
         reading = Reading(
             reading.motor1,
             reading.motor2,
@@ -970,6 +972,7 @@ def parse_stream_line(line: str) -> Reading | None:
             joy_y=to_angle(parts[5]),
             button=to_switch(parts[6]),
             trigger=to_switch(parts[7]),
+            trigger_percent=to_angle(parts[8]) if len(parts) == 9 else math.nan,
         )
 
     return reading
@@ -1192,6 +1195,7 @@ class StlinkSource:
                     joy_y=r.joy_y,
                     button=r.button,
                     trigger=r.trigger,
+                    trigger_percent=r.trigger_percent,
                 )
 
             if time.monotonic() > deadline:
@@ -1449,7 +1453,8 @@ class Angles:
     joy_x       joystick X, -1.0 .. +1.0 (0 = middle), nan if not available
     joy_y       joystick Y, -1.0 .. +1.0 (0 = middle), nan if not available
     button      1 = pressed, 0 = not, None if not available
-    trigger     1 = on, 0 = off, None if not available
+    trigger     legacy trigger above 50%: 1 or 0; None if unavailable
+    trigger_percent  analog trigger percentage 0..100; nan until calibrated
 
     With no saved center, or raw=True, arm_roll and arm_twist are the
     drivers' own angles. When no rail zero is in use (no center, a center
@@ -1467,6 +1472,7 @@ class Angles:
     joy_y: float = math.nan
     button: int | None = None
     trigger: int | None = None
+    trigger_percent: float = math.nan
 
     # The earlier names, kept so existing code keeps working.
     @property
@@ -1680,6 +1686,7 @@ class EncoderStream:
             joy_y=reading.joy_y,
             button=reading.button,
             trigger=reading.trigger,
+            trigger_percent=reading.trigger_percent,
         )
 
     def _require_foreground(self, what: str) -> None:
@@ -1783,6 +1790,7 @@ def print_stream(encoders: EncoderStream, style: str) -> None:
                     "joy_y": _json_number(angles.joy_y),
                     "button": angles.button,
                     "trigger": angles.trigger,
+                    "trigger_percent": _json_number(angles.trigger_percent),
                 }
             )
         elif style == "labeled":
@@ -1792,14 +1800,16 @@ def print_stream(encoders: EncoderStream, style: str) -> None:
                 f"arm_v={fmt(angles.arm_v):>9} "
                 f"joy_x={fmt(angles.joy_x):>6} joy_y={fmt(angles.joy_y):>6} "
                 f"button={fmt_switch(angles.button)} "
-                f"trigger={fmt_switch(angles.trigger)}"
+                f"trigger={fmt_switch(angles.trigger)} "
+                f"trigger_percent={fmt(angles.trigger_percent)}"
             )
         else:
             line = (
                 f"{time_ms},{fmt(angles.arm_roll)},"
                 f"{fmt(angles.arm_twist)},{fmt(angles.arm_v)},"
                 f"{fmt(angles.joy_x)},{fmt(angles.joy_y)},"
-                f"{fmt_switch(angles.button)},{fmt_switch(angles.trigger)}"
+                f"{fmt_switch(angles.button)},{fmt_switch(angles.trigger)},"
+                f"{fmt(angles.trigger_percent)}"
             )
 
         print(line, flush=True)

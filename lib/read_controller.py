@@ -10,7 +10,8 @@ board's USB-C plugged in, any serial monitor shows the same stream.)
     python read_controller.py --rate 50   50 lines a second
 
 Each line: time_ms, arm_roll, arm_twist, arm_v (degrees), joy_x, joy_y
-(-1..+1), button and trigger (1 = on, 0 = off). nan = no answer.
+(-1..+1), button (0/1), legacy trigger (0/1), trigger_percent (0..100).
+Requires the updated CTL2 controller firmware; nan = not calibrated/no answer.
 
 Use it from other code (keep read_trigger.py in the same folder):
 
@@ -35,8 +36,8 @@ from dataclasses import dataclass
 from read_trigger import OpenOcd, TriggerError, find_openocd, install_stop_signals
 
 # Must match firmware/controller/controller.ino.
-SHARE_MAGIC = 0x314C5443  # "CTL1"
-SHARE_WORDS = 10
+SHARE_MAGIC = 0x324C5443  # "CTL2"
+SHARE_WORDS = 12
 FLAG_BUTTON = 1 << 0
 FLAG_TRIGGER = 1 << 1
 
@@ -47,7 +48,7 @@ SCAN_CHUNK_WORDS = 1024
 # The board is taken as stopped if its counter does not move for this long.
 STALL_AFTER_S = 1.0
 
-HEADER = "time_ms,arm_roll,arm_twist,arm_v,joy_x,joy_y,button,trigger"
+HEADER = "time_ms,arm_roll,arm_twist,arm_v,joy_x,joy_y,button,trigger,trigger_percent"
 
 ControllerError = TriggerError
 
@@ -63,7 +64,8 @@ class ControllerReading:
     joy_x_raw: int  # 0..4095
     joy_y_raw: int  # 0..4095
     button: int  # 1 = pressed
-    trigger: int  # 1 = on
+    trigger: int  # legacy 1 = >50% of trigger travel
+    trigger_percent: float  # 0..100; nan until full-squeeze calibration
 
 
 class ControllerReader:
@@ -93,7 +95,7 @@ class ControllerReader:
 
         raise ControllerError(
             "The controller firmware is not running on the board "
-            "(flash firmware/controller/controller.ino)."
+            "(flash the updated CTL2 firmware/controller/controller.ino)."
         )
 
     def __enter__(self) -> ControllerReader:
@@ -132,6 +134,7 @@ class ControllerReader:
             joy_y_raw=packed >> 16,
             button=1 if flags & FLAG_BUTTON else 0,
             trigger=1 if flags & FLAG_TRIGGER else 0,
+            trigger_percent=struct.unpack("<f", struct.pack("<I", words[11]))[0],
         )
 
     def close(self) -> None:
@@ -166,7 +169,7 @@ def main() -> int:
                 r = controller.read()
                 print(
                     f"{r.time_ms},{fmt(r.arm_roll)},{fmt(r.arm_twist)},{fmt(r.arm_v)},"
-                    f"{fmt(r.joy_x)},{fmt(r.joy_y)},{r.button},{r.trigger}",
+                    f"{fmt(r.joy_x)},{fmt(r.joy_y)},{r.button},{r.trigger},{fmt(r.trigger_percent)}",
                     flush=True,
                 )
                 time.sleep(1.0 / rate)
